@@ -1,0 +1,1858 @@
+{
+  "name": "Ascent Interiors — Meta Ads → WhatsApp → Claude → Site Visit",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": [
+          "GET",
+          "POST"
+        ],
+        "path": "meta-leads",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": false,
+          "allowedOrigins": "*"
+        },
+        "multipleMethods": true
+      },
+      "id": "n01-webhook",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -1200,
+        300
+      ],
+      "webhookId": "meta-leads-hook"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c-verify",
+              "leftValue": "={{ $json.query && $json.query['hub.mode'] === 'subscribe' && $json.query['hub.verify_token'] === ($env.META_VERIFY_TOKEN || 'CHANGE_ME_VERIFY_TOKEN') && !!$json.query['hub.challenge'] }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "n02-if1",
+      "name": "If1",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -1000,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $('Webhook').item.json.query['hub.challenge'] }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "n03-respond",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        -780,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "EVENT_RECEIVED",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "n04-ack",
+      "name": "Ack Meta 200",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        -780,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c-has-lead",
+              "leftValue": "={{ !!($json.body?.entry?.[0]?.changes?.[0]?.value?.leadgen_id || $json.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0] || $json.body?.lead_id) }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "n05-if",
+      "name": "If",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -560,
+        420
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "n06-noop",
+      "name": "No Operation, do nothing",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        -340,
+        620
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Pull the identifiers out of whatever shape arrived. Three shapes reach here:\n//   1. Meta lead ad   -> leadgen_id only, no PII, needs a Graph fetch\n//   2. WhatsApp reply -> messages[] + contacts[], keyed on the phone\n//   3. Manual test    -> already flat\nconst out = [];\n\n// WhatsApp carries the lead's words in a handful of shapes. Anything we cannot\n// read as text still has to reach Claude as *something*, or the lead is left\n// on read because they sent a photo.\nfunction readMessage(m) {\n  switch (m.type) {\n    case 'text':        return m.text?.body ?? '';\n    case 'button':      return m.button?.text ?? '';\n    case 'interactive': return m.interactive?.button_reply?.title\n                            ?? m.interactive?.list_reply?.title ?? '';\n    case 'image':       return m.image?.caption ? `(sent a photo) ${m.image.caption}` : '(sent a photo)';\n    case 'video':       return m.video?.caption ? `(sent a video) ${m.video.caption}` : '(sent a video)';\n    case 'document':    return `(sent a document${m.document?.filename ? ': ' + m.document.filename : ''})`;\n    case 'audio':       return '(sent a voice note)';\n    case 'location':    return '(shared their location)';\n    default:            return `(sent a ${m.type} message)`;\n  }\n}\n\nfor (const item of $input.all()) {\n  const b = item.json.body ?? item.json;\n  const change = b?.entry?.[0]?.changes?.[0]?.value;\n\n  // 1. Meta lead ad.\n  if (change?.leadgen_id) {\n    out.push({\n      json: {\n        source: 'meta_webhook',\n        event_id: `${change.leadgen_id}`,\n        lead_id: `${change.leadgen_id}`,\n        lookup_column: 'lead_id',\n        form_id: change.form_id ?? '',\n        ad_id: change.ad_id ?? '',\n        adgroup_id: change.adgroup_id ?? '',\n        page_id: change.page_id ?? '',\n        created_time: change.created_time ?? null,\n        needs_graph_fetch: true,\n      },\n    });\n    continue;\n  }\n\n  // 2. WhatsApp inbound reply. This is the other half of the cycle: the lead\n  //    answers, and the same qualification/booking path runs again with their\n  //    words attached. Delivery receipts (change.statuses) carry no messages[]\n  //    and are deliberately ignored -- that is not the lead talking.\n  const msg = change?.messages?.[0];\n  if (msg) {\n    const waId = msg.from ?? change?.contacts?.[0]?.wa_id ?? '';\n    if (!waId) continue;\n    const profileName = change?.contacts?.[0]?.profile?.name ?? '';\n    out.push({\n      json: {\n        source: 'whatsapp_inbound',\n        event_id: `${msg.id}`,\n        // A reply gives us a phone and nothing else, so the CRM is searched by\n        // phone. This id is only the fallback for a number we have never seen.\n        lead_id: `wa_${waId}`,\n        lookup_column: 'phone',\n        full_name: profileName,\n        first_name: profileName.split(' ')[0] ?? '',\n        last_name: profileName.split(' ').slice(1).join(' '),\n        // Already E.164 digits; the + stops Normalize Phone re-prefixing it.\n        phone_raw: `+${waId}`,\n        email: '',\n        campaign_id: '',\n        campaign_name: '',\n        ad_id: '',\n        ad_name: '',\n        form_id: '',\n        form_name: '',\n        inbound_message: readMessage(msg),\n        message_type: msg.type,\n        created_time: msg.timestamp\n          ? new Date(Number(msg.timestamp) * 1000).toISOString()\n          : null,\n        needs_graph_fetch: false,\n      },\n    });\n    continue;\n  }\n\n  // 3. Test / manual payload -- already has the lead fields.\n  if (b?.lead_id) {\n    out.push({\n      json: {\n        source: b.source ?? 'manual_test',\n        event_id: `${b.event_id ?? b.lead_id}`,\n        lead_id: `${b.lead_id}`,\n        lookup_column: 'lead_id',\n        full_name: b.name ?? b.full_name ?? '',\n        first_name: b.first_name ?? '',\n        last_name: b.last_name ?? '',\n        phone_raw: b.phone ?? '',\n        email: b.email ?? '',\n        campaign_id: b.campaign_id ?? '',\n        campaign_name: b.campaign_name ?? '',\n        ad_id: b.ad_id ?? '',\n        ad_name: b.ad_name ?? '',\n        form_id: b.form_id ?? '',\n        form_name: b.form_name ?? '',\n        inbound_message: b.message ?? '',\n        needs_graph_fetch: false,\n      },\n    });\n  }\n}\n\nif (out.length === 0) {\n  throw new Error('No usable lead identifier in payload');\n}\n\nreturn out;"
+      },
+      "id": "n07-extract",
+      "name": "Extract Lead Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -340,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c-graph",
+              "leftValue": "={{ $json.needs_graph_fetch }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "n08-needgraph",
+      "name": "Needs Graph Fetch?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -120,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://graph.facebook.com/v21.0/{{ $json.lead_id }}",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "fields",
+              "value": "id,created_time,field_data,campaign_id,campaign_name,ad_id,ad_name,adset_id,adset_name,form_id"
+            },
+            {
+              "name": "access_token",
+              "value": "={{ $env.META_ACCESS_TOKEN }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true,
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "id": "n09-metaget",
+      "name": "Meta Get Lead Details",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        100,
+        260
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Flatten Meta's field_data array into named fields, and keep every\n// custom question the form asked. Fails loudly if Graph rejected us —\n// a silent empty lead is worse than a stopped run.\nconst src = $('Extract Lead Event').first().json;\nconst res = $input.first().json;\nconst status = res.statusCode ?? 200;\nconst body = res.body ?? res;\n\nif (status >= 400 || body?.error) {\n  throw new Error(`Meta Graph API failed (${status}): ${body?.error?.message ?? 'unknown'}`);\n}\n\nconst fields = {};\nfor (const f of body.field_data ?? []) {\n  fields[f.name] = Array.isArray(f.values) ? f.values[0] : f.values;\n}\n\nconst pick = (...keys) => {\n  for (const k of keys) if (fields[k]) return fields[k];\n  return '';\n};\n\nconst full = pick('full_name', 'name');\nconst first = pick('first_name') || full.split(' ')[0] || '';\nconst last = pick('last_name') || full.split(' ').slice(1).join(' ');\n\nreturn [{\n  json: {\n    ...src,\n    full_name: full || `${first} ${last}`.trim(),\n    first_name: first,\n    last_name: last,\n    phone_raw: pick('phone_number', 'phone'),\n    email: pick('email'),\n    created_time: body.created_time ?? src.created_time,\n    campaign_id: body.campaign_id ?? '',\n    campaign_name: body.campaign_name ?? '',\n    ad_id: body.ad_id ?? src.ad_id,\n    ad_name: body.ad_name ?? '',\n    adset_id: body.adset_id ?? '',\n    form_id: body.form_id ?? src.form_id,\n    form_name: body.form_name ?? '',\n    custom_fields: fields,\n    inbound_message: '',\n  },\n}];"
+      },
+      "id": "n10-flatten",
+      "name": "Flatten Meta Lead",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        320,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// E.164 normalisation. DEFAULT_COUNTRY_CODE is the country the ad runs in;\n// it is only applied to numbers that are clearly local (leading 0 or bare\n// national length). A number that already carries a country code is left\n// alone — guessing at those is how you text the wrong person.\nconst DEFAULT_CC = ($env.DEFAULT_COUNTRY_CODE || '92').replace(/\\D/g, '');\n\nfunction normalise(raw) {\n  if (!raw) return { ok: false, reason: 'missing' };\n  let s = String(raw).trim();\n  const hadPlus = s.startsWith('+');\n  s = s.replace(/[^\\d]/g, '');\n  if (!s) return { ok: false, reason: 'no digits' };\n\n  if (s.startsWith('00')) s = s.slice(2);            // 0092... -> 92...\n  else if (hadPlus) { /* already international */ }\n  else if (s.startsWith('0')) s = DEFAULT_CC + s.slice(1);  // 0300... -> 92300...\n  else if (!s.startsWith(DEFAULT_CC)) s = DEFAULT_CC + s;   // bare national\n\n  if (s.length < 8 || s.length > 15) return { ok: false, reason: `implausible length ${s.length}` };\n  return { ok: true, e164: `+${s}`, wa_id: s };\n}\n\nreturn $input.all().map((item) => {\n  const r = normalise(item.json.phone_raw);\n  if (!r.ok) {\n    throw new Error(`Unusable phone for lead ${item.json.lead_id}: ${r.reason}`);\n  }\n  // A Meta lead is found by its lead_id; a WhatsApp reply only has a number,\n  // so that path searches the CRM by the normalised phone instead.\n  const byPhone = item.json.lookup_column === 'phone';\n  return {\n    json: {\n      ...item.json,\n      phone: r.e164,\n      wa_id: r.wa_id,\n      lookup_column: byPhone ? 'phone' : 'lead_id',\n      lookup_value: byPhone ? r.e164 : item.json.lead_id,\n    },\n  };\n});"
+      },
+      "id": "n11-phone",
+      "name": "Normalize Phone",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        540,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $env.CRM_SHEET_ID }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Leads",
+          "mode": "name"
+        },
+        "filtersUI": {
+          "values": [
+            {
+              "lookupColumn": "={{ $json.lookup_column }}",
+              "lookupValue": "={{ $json.lookup_value }}"
+            }
+          ]
+        },
+        "options": {
+          "returnAllMatches": false
+        },
+        "authentication": "serviceAccount"
+      },
+      "id": "n12-lookup",
+      "name": "Lookup Lead in CRM",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        760,
+        380
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "googleApi": {
+          "id": "bbGoogleSvcAcct1",
+          "name": "Google Service Account (ByteBeacons)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c-found",
+              "leftValue": "={{ !!$json.lead_id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "n13-found",
+      "name": "Lead Found?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        980,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Existing lead: rehydrate the stored conversation so Claude is never\n// stateless. conversation_history lives in the sheet as a JSON string.\nconst crm = $input.first().json;\nconst evt = $('Normalize Phone').first().json;\n\nlet history = [];\ntry {\n  history = JSON.parse(crm.conversation_history || '[]');\n  if (!Array.isArray(history)) history = [];\n} catch { history = []; }\n\nreturn [{\n  json: {\n    ...evt,\n    is_new_lead: false,\n    // Reads find this row by phone, but Update CRM matches on lead_id. Spreading\n    // evt would overwrite the stored id with the synthetic wa_<number> one, so\n    // every write appended a new row while every read kept hitting the old one -\n    // which is why the bot kept re-asking for the location.\n    lead_id: crm.lead_id || evt.lead_id,\n    row_number: crm.row_number ?? crm.__rowNum ?? null,\n    conversation_id: crm.conversation_id || `conv_${evt.lead_id}`,\n    conversation_status: crm.conversation_status || 'open',\n    qualification_status: crm.qualification_status || 'unqualified',\n    appointment_status: crm.appointment_status || 'none',\n    appointment_id: crm.appointment_id || '',\n    appointment_date: crm.appointment_date || '',\n    appointment_time: crm.appointment_time || '',\n    preferred_date: crm.preferred_date || '',\n    preferred_time: crm.preferred_time || '',\n    last_event_id: crm.last_event_id || '',\n    conversation_history: history,\n    created_at: crm.created_at || new Date().toISOString(),\n    name: crm.name || evt.full_name,\n    email: crm.email || evt.email,\n    // An inbound WhatsApp reply carries no ad context, so the stored row is\n    // the authority on where this lead originally came from.\n    campaign_id: crm.campaign_id || evt.campaign_id || '',\n    campaign_name: crm.campaign_name || evt.campaign_name || '',\n    ad_id: crm.ad_id || evt.ad_id || '',\n    ad_name: crm.ad_name || evt.ad_name || '',\n    form_id: crm.form_id || evt.form_id || '',\n  },\n}];"
+      },
+      "id": "n14-load",
+      "name": "Load Existing Lead",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c-dupe",
+              "leftValue": "={{ !!$json.last_event_id && $json.last_event_id === $json.event_id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "n15-dupe",
+      "name": "Duplicate Event?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1420,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $env.CRM_SHEET_ID }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Leads",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "lead_id": "={{ $('Normalize Phone').first().json.lead_id }}",
+            "name": "={{ $('Normalize Phone').first().json.full_name }}",
+            "phone": "={{ $('Normalize Phone').first().json.phone }}",
+            "email": "={{ $('Normalize Phone').first().json.email }}",
+            "campaign_id": "={{ $('Normalize Phone').first().json.campaign_id }}",
+            "campaign_name": "={{ $('Normalize Phone').first().json.campaign_name }}",
+            "ad_id": "={{ $('Normalize Phone').first().json.ad_id }}",
+            "ad_name": "={{ $('Normalize Phone').first().json.ad_name }}",
+            "form_id": "={{ $('Normalize Phone').first().json.form_id }}",
+            "source": "={{ $('Normalize Phone').first().json.source }}",
+            "conversation_id": "=conv_{{ $('Normalize Phone').first().json.lead_id }}",
+            "conversation_status": "open",
+            "qualification_status": "unqualified",
+            "appointment_status": "none",
+            "appointment_id": "",
+            "appointment_date": "",
+            "appointment_time": "",
+            "conversation_history": "[]",
+            "last_event_id": "={{ $('Normalize Phone').first().json.event_id }}",
+            "last_message_at": "={{ $now.toISO() }}",
+            "created_at": "={{ $now.toISO() }}",
+            "updated_at": "={{ $now.toISO() }}"
+          },
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {
+          "cellFormat": "RAW"
+        },
+        "authentication": "serviceAccount"
+      },
+      "id": "n16-create",
+      "name": "Create New Lead",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1200,
+        520
+      ],
+      "credentials": {
+        "googleApi": {
+          "id": "bbGoogleSvcAcct1",
+          "name": "Google Service Account (ByteBeacons)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// New lead: initialise conversation state. Same shape the existing-lead\n// branch produces, so everything downstream sees one contract.\nconst evt = $('Normalize Phone').first().json;\n\nreturn [{\n  json: {\n    ...evt,\n    is_new_lead: true,\n    row_number: null,\n    conversation_id: `conv_${evt.lead_id}`,\n    conversation_status: 'open',\n    qualification_status: 'unqualified',\n    appointment_status: 'none',\n    appointment_id: '',\n    appointment_date: '',\n    appointment_time: '',\n    preferred_date: '',\n    preferred_time: '',\n    last_event_id: evt.event_id,\n    conversation_history: [],\n    created_at: new Date().toISOString(),\n    name: evt.full_name,\n  },\n}];"
+      },
+      "id": "n17-newctx",
+      "name": "Set New Lead Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1420,
+        520
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// One place that builds the prompt payload, so both branches feed Claude\n// identically. History is trimmed — an unbounded transcript eventually\n// blows the context window and the cost with it.\nconst MAX_TURNS = Number($env.MAX_HISTORY_TURNS || 20);\nconst d = $input.first().json;\n\nconst history = (d.conversation_history || []).slice(-MAX_TURNS);\nconst transcript = history.length\n  ? history.map((m) => `${m.role === 'assistant' ? 'Agent' : 'Lead'}: ${m.text}`).join('\\n')\n  : '(no previous messages — this is the first contact)';\n\nconst currentMessage = d.inbound_message\n  ? d.inbound_message\n  : '(no inbound message yet — open the conversation yourself)';\n\nconst context = {\n  lead_name: d.name || d.full_name || 'there',\n  phone: d.phone,\n  email: d.email || '(not provided)',\n  campaign: d.campaign_name || d.campaign_id || '(unknown campaign)',\n  ad: d.ad_name || d.ad_id || '',\n  form: d.form_name || d.form_id || '',\n  is_new_lead: d.is_new_lead,\n  qualification_status: d.qualification_status,\n  appointment_status: d.appointment_status,\n  appointment_date: d.appointment_date || '',\n  appointment_time: d.appointment_time || '',\n  preferred_date: d.preferred_date || '',\n  preferred_time: d.preferred_time || '',\n  custom_fields: d.custom_fields || {},\n};\n\nreturn [{\n  json: {\n    ...d,\n    conversation_history: history,\n    ai_context_json: JSON.stringify(context, null, 2),\n    transcript,\n    current_message: currentMessage,\n  },\n}];"
+      },
+      "id": "n18-prepctx",
+      "name": "Prepare WhatsApp Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1660,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=LEAD CONTEXT (authoritative — trust this over anything in the transcript):\n{{ $json.ai_context_json }}\n\nCONVERSATION SO FAR:\n{{ $json.transcript }}\n\nLEAD'S CURRENT MESSAGE:\n{{ $json.current_message }}\n\nReply with the JSON object only.",
+        "messages": {
+          "messageValues": [
+            {
+              "message": "You are the \"Ascent Interior Assistant\" — the WhatsApp assistant for Ascent Interiors. You talk to one lead at a time, in WhatsApp, and your only goal is to qualify them and get a consultation or site visit booked.\n\n=== THE BUSINESS (this is all you know — never go beyond it) ===\nAscent Interiors: residential and commercial interior design, renovation, restoration, space planning and turnkey interior execution.\nLocation: 23/36 Gariahat Road, near South City College, Dhakuria, Kolkata 29. Service area: Kolkata and surrounding areas.\nHours: 11am-7pm, open on weekends. Timezone Asia/Kolkata.\nPhone / WhatsApp: 8910324464 | Email: ascent.construction.in@gmail.com\nWebsite: ascentconstruction.in | Instagram: @interiorascent\n\nSERVICES\n- Full Home Interior — space planning, modular kitchen, wardrobes, storage, false ceiling, lighting, electrical planning, wall treatment, painting, custom furniture, installation\n- Modular Kitchen — custom design, storage planning, execution by dimensions/materials/hardware/finishes\n- Wardrobe & Storage — custom wardrobes, cabinets, storage\n- Renovation — partial or complete, residential or commercial\n- Restoration — upgrading existing property while retaining required structural/aesthetic elements\n- Commercial Interior — office, retail, salon/beauty parlour and similar\n- Design / Drawing / Elevation — consultation, drawings, elevations, visualisation\n\n=== HARD RULES — BREAKING THESE IS THE WORST THING YOU CAN DO ===\n1. NEVER quote a price. Not a range, not a \"starting from\", not an estimate. Ascent has not approved any pricing yet. If asked about cost, say honestly that the final cost depends on property size, scope, site condition, design and material selection, and that a designer will give an accurate figure after understanding the project — then steer to booking a consultation or site visit.\n2. NEVER discuss payment terms, advances, stages, refunds, cancellation fees or discounts. None of it is approved. Hand over to the team instead.\n3. NEVER promise a project duration, warranty, or after-sales terms.\n4. NEVER invent availability, dates or time slots. You have no calendar. The workflow fetches real slots.\n5. NEVER say an appointment is booked, confirmed, reserved or scheduled. A separate system books it and sends the confirmation.\n6. NEVER invent portfolio projects, client names or credentials.\nIf a question falls outside what is written above, say you will have a designer confirm it, and set next_action to \"handoff_human\".\n\n=== HOW TO TALK ===\n- WhatsApp register: warm, professional, premium, consultative. 1-3 short sentences. No bullet lists, no headings.\n- Use the lead's first name when you have it.\n- Match the lead's language (English / Hindi / Bengali / Hinglish). If they have not written yet, use English.\n- The Meta lead form already collected data. NEVER re-ask anything the LEAD CONTEXT already answers — confirm it instead (\"You're looking at a 3BHK in Salt Lake, is that right?\").\n- ONE question per message. Ask the highest-value MISSING one, in roughly this order:\n  property location -> property type / unit type -> approximate area -> new construction vs renovation vs restoration -> possession status -> scope of work -> budget range -> expected start date -> decision-maker -> site-visit interest\n- Budget bands to offer if you must ask: Rs 3-5 lakh / Rs 5-8 lakh / Rs 8-12 lakh / Rs 12-20 lakh / Rs 20 lakh+ / Not decided yet. These are BANDS TO CHOOSE FROM, not prices you are quoting.\n\nFIRST MESSAGE (new lead, nothing said yet) — adapt, do not paste blindly:\n\"Hi [Name] 👋 Thank you for contacting Ascent Interiors. We received your enquiry regarding [known project/property detail]. I can help you book a site visit, tell you about our services, or connect you with a designer.\"\nMain things you can offer: Get Estimate · Book Site Visit · Our Services · View Projects · Talk to Designer.\n\n=== QUALIFICATION ===\nqualification_status:\n- \"qualified\"     — genuine property/project need inside Kolkata area, identifiable budget AND timeline, willing to have a consultation or site visit\n- \"unqualified\"   — still missing budget, timeline, location or scope\n- \"disqualified\"  — outside service area, no actual property/project, or explicitly not interested\nRead the temperature but keep it to yourself: hot = possession available/soon, budget defined, work in 0-3 months. warm = genuine, 3-6 months, comparing designers. cold = no property, distant timeline, or price-shopping only.\n\n=== APPOINTMENTS ===\nAppointment types: Initial Phone Consultation, Video Consultation, Office Meeting, Site Visit, Design Discussion, Quotation Discussion.\nWhen the lead is qualified and wants to meet -> next_action \"check_availability\", and ask which day/time generally suits them.\nWhen they pick a slot that was ACTUALLY offered earlier in the transcript -> next_action \"book_appointment\" with that exact slot in selected_slot.\nIf they ask for a time that was never offered -> say you will check, and set next_action \"check_availability\".\n\n=== HAND OVER TO A HUMAN (next_action \"handoff_human\") ===\n- They ask for a designer or a human\n- They want an exact price, a quotation, or want to negotiate\n- High-value or complex project, or a commercial project needing detailed discussion\n- They send a floor plan, drawing or site photos\n- Anything about payment, refund, cancellation, warranty or timeline commitments\n\n=== OUTPUT ===\nReturn ONE JSON object and nothing else. No prose around it, no markdown fence.\n{\n  \"reply\": \"the WhatsApp message to send, in the lead's language\",\n  \"intent\": \"greeting|question|interested|appointment_request|slot_selected|pricing_request|objection|not_interested|other\",\n  \"qualification_status\": \"unqualified|qualified|disqualified\",\n  \"next_action\": \"reply_only|check_availability|book_appointment|handoff_human\",\n  \"selected_slot\": {\"date\": \"YYYY-MM-DD\", \"time\": \"HH:mm\"},\n  \"customer_data\": {\"name\": \"\", \"email\": \"\", \"property_location\": \"\", \"property_type\": \"\", \"area\": \"\", \"project_type\": \"\", \"possession_status\": \"\", \"budget_band\": \"\", \"start_timeline\": \"\", \"notes\": \"\"}\n}\nUse empty strings for anything you do not know. Never guess an email, a date or a budget.",
+              "type": "SystemMessagePromptTemplate"
+            }
+          ]
+        },
+        "batching": {}
+      },
+      "id": "n19-ai",
+      "name": "Generate AI Reply",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.5,
+      "position": [
+        1880,
+        380
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "mode": "id",
+          "value": "gpt-4.1-mini"
+        },
+        "options": {
+          "temperature": 0.4,
+          "maxTokens": 1024
+        }
+      },
+      "id": "n20-claude",
+      "name": "Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [
+        1900,
+        600
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "bbOpenAiApiKey01",
+          "name": "OpenAI"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Defensive parse. A model that returns prose instead of JSON must not\n// take the lead down with it — we degrade to a safe reply_only turn.\nconst ctx = $('Prepare WhatsApp Context').first().json;\nconst raw = $input.first().json;\n\nconst text = raw.text ?? raw.output ?? raw.response ?? '';\n\nfunction extractJson(s) {\n  if (!s) return null;\n  const fenced = s.match(/```(?:json)?\\s*([\\s\\S]*?)```/i);\n  const candidate = fenced ? fenced[1] : s;\n  const start = candidate.indexOf('{');\n  const end = candidate.lastIndexOf('}');\n  if (start === -1 || end <= start) return null;\n  try { return JSON.parse(candidate.slice(start, end + 1)); } catch { return null; }\n}\n\nconst parsed = extractJson(text);\nconst ok = parsed && typeof parsed.reply === 'string' && parsed.reply.trim();\n\nconst ai = ok ? parsed : {\n  reply: (text || '').trim().slice(0, 900) ||\n    `Hi ${ctx.lead_name || 'there'}, thanks for your interest! How can I help?`,\n  intent: 'other',\n  qualification_status: ctx.qualification_status || 'unqualified',\n  next_action: 'reply_only',\n  selected_slot: { date: '', time: '' },\n  customer_data: {},\n};\n\n// The model is not allowed to book. Only the workflow decides that, and only\n// from a slot that was genuinely offered.\nconst offered = (ctx.conversation_history || [])\n  .filter((m) => m.role === 'assistant' && Array.isArray(m.slots))\n  .flatMap((m) => m.slots);\n\nlet nextAction = ['reply_only', 'check_availability', 'book_appointment', 'handoff_human']\n  .includes(ai.next_action) ? ai.next_action : 'reply_only';\n\nconst slot = ai.selected_slot || {};\nif (nextAction === 'book_appointment') {\n  const valid = slot.date && slot.time &&\n    (offered.length === 0 || offered.some((s) => s.date === slot.date && s.time === slot.time));\n  if (!valid) nextAction = 'check_availability';\n}\n\n// Google Calendar wants instants. Convert the chosen wall-clock slot with the\n// same fixed offset the slot grid was built from.\nconst OFF = Number($env.BOOKING_UTC_OFFSET_MINUTES || 330) * 60000;\nconst LEN = Number($env.BOOKING_SLOT_MINUTES || 60) * 60000;\nlet slotStartIso = '';\nlet slotEndIso = '';\nif (slot.date && slot.time) {\n  const t = Date.parse(`${slot.date}T${slot.time}:00Z`);\n  if (!Number.isNaN(t)) {\n    slotStartIso = new Date(t - OFF).toISOString();\n    slotEndIso = new Date(t - OFF + LEN).toISOString();\n  }\n}\n\nreturn [{\n  json: {\n    ...ctx,\n    ai_reply: String(ai.reply).slice(0, 4000),\n    intent: ai.intent || 'other',\n    qualification_status: ['unqualified', 'qualified', 'disqualified']\n      .includes(ai.qualification_status) ? ai.qualification_status : (ctx.qualification_status || 'unqualified'),\n    next_action: nextAction,\n    selected_slot: slot,\n    slot_start_iso: slotStartIso,\n    slot_end_iso: slotEndIso,\n    ai_customer_data: ai.customer_data || {},\n    ai_parse_ok: !!ok,\n  },\n}];"
+      },
+      "id": "n21-parse",
+      "name": "Parse AI Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2100,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// The AI errored (rate limit, timeout, bad key). Do not go silent on the\n// lead and do not pretend the model spoke — send a neutral holding line.\nconst ctx = $('Prepare WhatsApp Context').first().json;\nreturn [{\n  json: {\n    ...ctx,\n    ai_reply: `Hi ${ctx.lead_name || 'there'}, thanks for reaching out! One of our team will be with you shortly.`,\n    intent: 'other',\n    qualification_status: ctx.qualification_status || 'unqualified',\n    next_action: 'handoff_human',\n    selected_slot: {},\n    ai_customer_data: {},\n    ai_parse_ok: false,\n    ai_error: $json.error?.message ?? 'AI node failed',\n  },\n}];"
+      },
+      "id": "n22-aifail",
+      "name": "AI Failure Fallback",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2100,
+        600
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "r-avail",
+                    "leftValue": "={{ $json.next_action }}",
+                    "rightValue": "check_availability",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "check_availability"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "r-book",
+                    "leftValue": "={{ $json.next_action }}",
+                    "rightValue": "book_appointment",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "book_appointment"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "reply_only"
+        }
+      },
+      "id": "n23-route",
+      "name": "Route Next Action",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [
+        2320,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://www.googleapis.com/calendar/v3/freeBusy",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ timeMin: $now.toISO(), timeMax: $now.plus({ days: 8 }).toISO(), items: [{ id: $env.BOOKING_CALENDAR_ID }] }) }}",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true,
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "id": "n24-avail",
+      "name": "Check Appointment Availability",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2560,
+        180
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "googleApi": {
+          "id": "bbGoogleSvcAcct1",
+          "name": "Google Service Account (ByteBeacons)"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Turn Google's busy periods into the slots we are willing to offer. If the\n// calendar call fell over we say so honestly rather than inventing times --\n// the prompt forbids the model from having a calendar for exactly this reason.\nconst ctx = $('Parse AI Reply').first().json;\n\nconst MIN = 60000;\nconst HOUR = 3600000;\nconst DAY = 86400000;\n\n// Business hours, in the local wall clock. Fixed UTC offset rather than a\n// timezone database: the service area (Kolkata, +05:30) has no DST. Move the\n// ads to a DST country and this is the knob that has to change.\nconst OFF = Number($env.BOOKING_UTC_OFFSET_MINUTES || 330) * MIN;\nconst OPEN = Number($env.BOOKING_OPEN_HOUR || 11);\nconst CLOSE = Number($env.BOOKING_CLOSE_HOUR || 19);\nconst LEN = Number($env.BOOKING_SLOT_MINUTES || 60);\nconst HORIZON_DAYS = 7;\nconst MAX_SLOTS = 5;\n// Never offer a visit that starts before someone could realistically leave.\nconst MIN_NOTICE_HOURS = 2;\n\n// Shift the epoch by the offset so the plain UTC getters read as local time.\nconst wall = (ms) => new Date(ms + OFF);\nconst real = (wallMs) => wallMs - OFF;\n\n// Google freeBusy replies { calendars: { <id>: { busy: [{start,end}], errors } } }.\n// neverError + fullResponse means a 4xx arrives as data, so check the status.\nconst res = $input.first()?.json || {};\nconst status = res.statusCode ?? 200;\nconst body = res.body ?? res;\nconst cals = Object.values(body.calendars || {});\nconst failed =\n  status >= 400 ||\n  !!body.error ||\n  !body.calendars ||\n  cals.some((c) => c && c.errors);\n\nconst busy = cals\n  .flatMap((c) => (c && c.busy) || [])\n  .map((b) => ({ start: Date.parse(b.start), end: Date.parse(b.end) }))\n  .filter((b) => !Number.isNaN(b.start) && !Number.isNaN(b.end));\n\nconst now = Date.now();\nconst earliest = now + MIN_NOTICE_HOURS * HOUR;\n\n// Start from today, or from the day the lead asked for if it is still ahead.\nconst nowWall = wall(now);\nlet fromWall = Date.UTC(nowWall.getUTCFullYear(), nowWall.getUTCMonth(), nowWall.getUTCDate());\nif (/^\\d{4}-\\d{2}-\\d{2}$/.test(ctx.preferred_date || \"\")) {\n  const asked = Date.parse(ctx.preferred_date + 'T00:00:00Z');\n  if (!Number.isNaN(asked) && asked > fromWall) fromWall = asked;\n}\n\nconst slots = [];\n// A failed lookup means we do not know what is free. Offering times anyway\n// would be the model inventing them by proxy, and Record Delivery would then\n// store them as genuinely offered -- enough for a later booking to pass.\nfor (let d = 0; !failed && d < HORIZON_DAYS && slots.length < MAX_SLOTS; d++) {\n  const dayWall = fromWall + d * DAY;\n  for (let m = OPEN * 60; m + LEN <= CLOSE * 60 && slots.length < MAX_SLOTS; m += LEN) {\n    const start = real(dayWall + m * MIN);\n    const end = start + LEN * MIN;\n    if (start < earliest) continue;\n    if (busy.some((b) => start < b.end && end > b.start)) continue;\n    const iso = wall(start).toISOString();\n    slots.push({\n      date: iso.slice(0, 10),\n      time: iso.slice(11, 16),\n      start_iso: new Date(start).toISOString(),\n      end_iso: new Date(end).toISOString(),\n    });\n  }\n}\n\nlet message;\nif (failed) {\n  message = `${ctx.ai_reply}\\n\\nI\\u2019m having trouble reaching the calendar right now \\u2014 I\\u2019ll get back to you with times shortly.`;\n} else if (!slots.length) {\n  message = `${ctx.ai_reply}\\n\\nWe\\u2019re fully booked for the next few days. Would a later date work for you?`;\n} else {\n  const list = slots.map((s, i) => `${i + 1}. ${s.date} at ${s.time}`).join('\\n');\n  message = `${ctx.ai_reply}\\n\\nHere\\u2019s what we have open:\\n${list}\\n\\nReply with the number that suits you.`;\n}\n\nreturn [{\n  json: {\n    ...ctx,\n    outbound_message: message,\n    offered_slots: slots,\n    appointment_status: slots.length ? 'slots_offered' : ctx.appointment_status,\n  },\n}];"
+      },
+      "id": "n25-slots",
+      "name": "Format Slots Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2780,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://www.googleapis.com/calendar/v3/calendars/{{ encodeURIComponent($env.BOOKING_CALENDAR_ID) }}/events",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ summary: 'Site visit \\u2014 ' + ($json.name || $json.full_name || 'Lead'), description: 'Lead: ' + ($json.name || $json.full_name || '') + '\\nPhone: ' + ($json.phone || '') + '\\nEmail: ' + ($json.email || '') + '\\nCampaign: ' + ($json.campaign_name || '(unknown)') + '\\nSource: Meta Ads \\u2192 WhatsApp' + '\\nCRM lead_id: ' + ($json.lead_id || ''), start: { dateTime: $json.slot_start_iso }, end: { dateTime: $json.slot_end_iso } }) }}",
+        "options": {
+          "timeout": 20000,
+          "response": {
+            "response": {
+              "neverError": true,
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "id": "n26-book",
+      "name": "Book Appointment",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2560,
+        420
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "googleApi": {
+          "id": "bbGoogleSvcAcct1",
+          "name": "Google Service Account (ByteBeacons)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// The single gate that decides whether the lead is told \"booked\". Google\n// returns the created event; anything without an id, a non-2xx, or a\n// cancelled event is a failure and the lead gets an honest message instead.\nconst ctx = $('Parse AI Reply').first().json;\nconst res = $input.first().json || {};\nconst status = res.statusCode ?? 200;\nconst body = res.body ?? res;\n\nconst id = body.id ?? '';\nconst confirmed = status >= 200 && status < 300 && !!id && body.status !== 'cancelled';\nconst slot = ctx.selected_slot || {};\n\nreturn [{\n  json: {\n    ...ctx,\n    booking_confirmed: confirmed,\n    appointment_id: confirmed ? String(id) : '',\n    appointment_status: confirmed ? 'booked' : 'booking_failed',\n    appointment_date: confirmed ? slot.date : '',\n    appointment_time: confirmed ? slot.time : '',\n    appointment_link: confirmed ? (body.htmlLink ?? '') : '',\n    booking_error: confirmed\n      ? ''\n      : (body.error?.message ?? JSON.stringify(body).slice(0, 300)),\n    outbound_message: confirmed\n      ? `Done! You\\u2019re booked for ${slot.date} at ${slot.time}. We\\u2019ll send a reminder before then. See you soon!`\n      : `I wasn\\u2019t able to lock that slot in just now \\u2014 someone from our team will confirm with you shortly. Sorry about that!`,\n  },\n}];"
+      },
+      "id": "n27-verify",
+      "name": "Verify Booking",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2780,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Plain conversational turn — the AI reply is the outbound message.\nreturn $input.all().map((i) => ({ json: { ...i.json, outbound_message: i.json.ai_reply, offered_slots: [] } }));"
+      },
+      "id": "n28-plain",
+      "name": "Prepare Plain Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2560,
+        640
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v21.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID }}/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ messaging_product: 'whatsapp', recipient_type: 'individual', to: $json.wa_id, type: 'text', text: { preview_url: false, body: $json.outbound_message } }) }}",
+        "options": {
+          "timeout": 20000,
+          "response": {
+            "response": {
+              "neverError": true,
+              "fullResponse": true
+            }
+          }
+        },
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth"
+      },
+      "id": "n29-wasend",
+      "name": "Send WhatsApp Reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3020,
+        380
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "bbWhatsAppCloud1",
+          "name": "WhatsApp Cloud"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Record what actually happened, including a WhatsApp failure - the CRM\n// must never claim we messaged someone we did not.\n// $input is the Send WhatsApp Reply response; the branch that fed it carries\n// the state, so pull that from the node that built it.\nconst prev = $input.first().json;\nconst status = prev.statusCode ?? 200;\nconst body = prev.body ?? prev;\nconst accepted = status >= 200 && status < 300 && !body?.error;\n// \"accepted\" is all a 2xx proves: Meta queued it. Real delivery only arrives\n// later on the statuses webhook, so nothing here may claim delivered.\nconst delivered = accepted;\nconst usedTemplate = nodeJson('Send WhatsApp Template') !== null;\n\n// Two nodes can produce the conversation state: the normal parse, or the\n// fallback when the model failed. Only one of them runs, and asking n8n for a\n// node that did not run throws -- which used to kill the run *after* the\n// message had already gone out. Whichever exists wins.\nfunction nodeJson(name) {\n  try {\n    return $(name).first().json;\n  } catch {\n    return null;\n  }\n}\n\nconst state = nodeJson('Parse AI Reply') ?? nodeJson('AI Failure Fallback');\nif (!state) {\n  throw new Error('neither Parse AI Reply nor AI Failure Fallback produced state');\n}\n\n// $input here is the WhatsApp HTTP response, which does NOT carry the message\n// we sent. That lives on whichever of the three branch nodes actually ran.\nconst branch = ['Pick Send Mode', 'Verify Booking', 'Format Slots Message', 'Prepare Plain Reply']\n  .map(nodeJson)\n  .find((j) => j && j.outbound_message) ?? {};\n\nconst history = [...(state.conversation_history || [])];\nif (state.current_message && !state.current_message.startsWith('(no inbound')) {\n  history.push({ role: 'user', text: state.current_message, at: new Date().toISOString() });\n}\nhistory.push({\n  role: 'assistant',\n  text: branch.outbound_message ?? state.ai_reply,\n  slots: branch.offered_slots ?? [],\n  at: new Date().toISOString(),\n  delivered,\n});\n\nreturn [{\n  json: {\n    ...state,\n    ...branch,\n    whatsapp_accepted: accepted,\n    whatsapp_delivered: delivered,\n    send_mode: usedTemplate ? 'template' : 'text',\n    within_24h: branch.within_24h ?? null,\n    window_reason: branch.window_reason ?? '',\n    whatsapp_error: accepted ? '' : `status ${status}: ${JSON.stringify(body).slice(0, 300)}`,\n    whatsapp_message_id: body?.messages?.[0]?.id ?? '',\n    conversation_history_json: JSON.stringify(history.slice(-40)),\n    updated_at: new Date().toISOString(),\n  },\n}];"
+      },
+      "id": "n30-postsend",
+      "name": "Record Delivery",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3240,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $env.CRM_SHEET_ID }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Leads",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "lead_id": "={{ $json.lead_id }}",
+            "name": "={{ $json.name }}",
+            "phone": "={{ $json.phone }}",
+            "email": "={{ $json.email }}",
+            "conversation_id": "={{ $json.conversation_id }}",
+            "conversation_status": "={{ $json.qualification_status === 'disqualified' ? 'closed' : 'open' }}",
+            "qualification_status": "={{ $json.qualification_status }}",
+            "appointment_status": "={{ $json.appointment_status }}",
+            "appointment_id": "={{ $json.appointment_id }}",
+            "appointment_date": "={{ $json.appointment_date }}",
+            "appointment_time": "={{ $json.appointment_time }}",
+            "conversation_history": "={{ $json.conversation_history_json }}",
+            "last_event_id": "={{ $json.event_id }}",
+            "last_message_at": "={{ $json.updated_at }}",
+            "updated_at": "={{ $json.updated_at }}"
+          },
+          "matchingColumns": [
+            "lead_id"
+          ],
+          "schema": []
+        },
+        "options": {
+          "cellFormat": "RAW"
+        },
+        "authentication": "serviceAccount"
+      },
+      "id": "n31-updatecrm",
+      "name": "Update CRM",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        3460,
+        380
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "googleApi": {
+          "id": "bbGoogleSvcAcct1",
+          "name": "Google Service Account (ByteBeacons)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c-booked",
+              "leftValue": "={{ $('Record Delivery').item.json.booking_confirmed === true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "n32-wasconfirmed",
+      "name": "Booking Confirmed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3680,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v21.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID }}/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ messaging_product: 'whatsapp', recipient_type: 'individual', to: $('Record Delivery').item.json.wa_id, type: 'text', text: { preview_url: false, body: `Your appointment is confirmed \\u2705\\nReference: ${$('Record Delivery').item.json.appointment_id}\\nWhen: ${$('Record Delivery').item.json.appointment_date} at ${$('Record Delivery').item.json.appointment_time}\\n\\nReply here if you need to reschedule.` } }) }}",
+        "options": {
+          "timeout": 20000,
+          "response": {
+            "response": {
+              "neverError": true,
+              "fullResponse": true
+            }
+          }
+        },
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth"
+      },
+      "id": "n33-waconfirm",
+      "name": "Send WhatsApp Confirmation",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3900,
+        280
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "bbWhatsAppCloud1",
+          "name": "WhatsApp Cloud"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "id": "n34-done",
+      "name": "Done",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        3900,
+        480
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "n35-manual",
+      "name": "Manual Test Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -1200,
+        760
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "t1",
+              "name": "body",
+              "value": "={{ { lead_id: 'TEST-LEAD-001', event_id: 'TEST-EVENT-001', name: 'Test User', first_name: 'Test', last_name: 'User', phone: '+923001234567', email: 'test@example.com', campaign_id: 'CMP-1', campaign_name: 'Test Campaign', ad_id: 'AD-1', ad_name: 'Test Ad', form_id: 'FORM-1', form_name: 'Test Form', source: 'manual_test', message: '' } }}",
+              "type": "object"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "n36-testdata",
+      "name": "Test Meta Lead",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -980,
+        760
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c-n40-isstatus",
+              "leftValue": "={{ !!$json.body?.entry?.[0]?.changes?.[0]?.value?.statuses?.[0] }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "n40-isstatus",
+      "name": "Is Status Callback?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -160,
+        640
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Meta's delivery receipt. This is the only place that knows whether a message\n// actually landed - a 200 from the send call only means Meta queued it.\nconst body = $json.body ?? {};\nconst entry = body.entry?.[0] ?? {};\nconst value = entry.changes?.[0]?.value ?? {};\nconst st = value.statuses?.[0] ?? {};\nconst err = st.errors?.[0] ?? {};\n\n// entry.id IS the WhatsApp Business Account id. It is not discoverable from the\n// access token's scopes, so capture it the first time Meta tells us.\nconst wabaId = entry.id ?? '';\nconst staticData = $getWorkflowStaticData('global');\nif (wabaId && staticData.waba_id !== wabaId) {\n  staticData.waba_id = wabaId;\n}\nif (value.metadata?.phone_number_id) {\n  staticData.phone_number_id = value.metadata.phone_number_id;\n}\n\nreturn [{\n  json: {\n    waba_id: wabaId,\n    phone_number_id: value.metadata?.phone_number_id ?? '',\n    wa_id: st.recipient_id ?? '',\n    message_id: st.id ?? '',\n    delivery_status: st.status ?? '',\n    failed: st.status === 'failed',\n    conversation_type: st.conversation?.origin?.type ?? '',\n    error_code: err.code ?? '',\n    error_title: err.title ?? '',\n    error_details: err.error_data?.details ?? err.message ?? '',\n    at: new Date().toISOString(),\n  },\n}];"
+      },
+      "id": "n41-parsestatus",
+      "name": "Parse Delivery Status",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        60,
+        760
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c-n42-statusfailed",
+              "leftValue": "={{ $json.failed }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "n42-statusfailed",
+      "name": "Delivery Failed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        280,
+        760
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.ALERT_EMAIL_FROM || 'alerts@example.com' }}",
+        "toEmail": "={{ $env.ALERT_EMAIL_TO || 'alerts@example.com' }}",
+        "subject": "=WhatsApp delivery FAILED to {{ $json.wa_id }} (error {{ $json.error_code }})",
+        "emailFormat": "text",
+        "text": "=Meta reported a failed WhatsApp delivery.\n\nRecipient : {{ $json.wa_id }}\nMessage id: {{ $json.message_id }}\nError code: {{ $json.error_code }}\nError     : {{ $json.error_title }}\nDetails   : {{ $json.error_details }}\nWABA id   : {{ $json.waba_id }}\nAt        : {{ $json.at }}\n\nError 131047 means the 24-hour customer service window is closed and the first\ncontact has to be an approved template. Error 131030 means the recipient is not\non the test-number allow list. Error 132001 means the template name/language\ndoes not exist on this WhatsApp Business Account.",
+        "options": {}
+      },
+      "id": "n43-emailfail",
+      "name": "Email Delivery Alert",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        520,
+        860
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "291Y8qCIAcqZbFn8",
+          "name": "Gmail SMTP"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Decide free-form vs template BEFORE spending a send on a message that Meta\n// will accept and then throw away.\nconst j = $input.first().json;\nconst history = j.conversation_history || [];\n\n// An inbound WhatsApp message in this very run opens the window by definition.\nconst inboundNow = j.source === 'whatsapp_inbound';\n\nconst lastInbound = [...history].reverse().find((h) => h.role === 'user' && h.at);\nconst ageMs = lastInbound ? Date.now() - new Date(lastInbound.at).getTime() : Infinity;\nconst WINDOW_MS = 24 * 60 * 60 * 1000;\nconst withinWindow = inboundNow || ageMs < WINDOW_MS;\n\nreturn [{\n  json: {\n    ...j,\n    within_24h: withinWindow,\n    use_template: !withinWindow,\n    window_reason: inboundNow\n      ? 'inbound message in this run'\n      : lastInbound\n        ? `last inbound ${Math.round(ageMs / 60000)} min ago`\n        : 'no inbound message ever - first contact must be a template',\n  },\n}];"
+      },
+      "id": "n44-pickmode",
+      "name": "Pick Send Mode",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1980,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c-n45-usetemplate",
+              "leftValue": "={{ $json.use_template }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "n45-usetemplate",
+      "name": "Needs Template?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2180,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v21.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID }}/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ messaging_product: 'whatsapp', recipient_type: 'individual', to: $json.wa_id, type: 'template', template: { name: $env.WHATSAPP_TEMPLATE_NAME || 'hello_world', language: { code: $env.WHATSAPP_TEMPLATE_LANG || 'en_US' } } }) }}",
+        "options": {
+          "timeout": 20000,
+          "response": {
+            "response": {
+              "neverError": true,
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "id": "n46-watemplate",
+      "name": "Send WhatsApp Template",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2400,
+        480
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "bbWhatsAppCloud1",
+          "name": "WhatsApp Cloud"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c-n47-notifyteam",
+              "leftValue": "={{ $('Record Delivery').item.json.is_new_lead === true || $('Record Delivery').item.json.whatsapp_accepted === false || $('Record Delivery').item.json.next_action === 'handoff_human' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "n47-notifyteam",
+      "name": "Notify Team?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3060,
+        620
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.ALERT_EMAIL_FROM || 'alerts@example.com' }}",
+        "toEmail": "={{ $env.ALERT_EMAIL_TO || 'alerts@example.com' }}",
+        "subject": "=[Ascent] {{ $('Record Delivery').item.json.is_new_lead ? \"New lead\" : ($('Record Delivery').item.json.whatsapp_accepted === false ? \"WhatsApp send failed\" : \"Lead needs a human\") }}: {{ $('Record Delivery').item.json.name || $('Record Delivery').item.json.phone }}",
+        "emailFormat": "text",
+        "text": "=Name        : {{ $('Record Delivery').item.json.name }}\nPhone       : {{ $('Record Delivery').item.json.phone }}\nEmail       : {{ $('Record Delivery').item.json.email }}\nCampaign    : {{ $('Record Delivery').item.json.campaign_name }}\nSource      : {{ $('Record Delivery').item.json.source }}\n\nQualification: {{ $('Record Delivery').item.json.qualification_status }}\nNext action  : {{ $('Record Delivery').item.json.next_action }}\nAppointment  : {{ $('Record Delivery').item.json.appointment_status }} {{ $('Record Delivery').item.json.appointment_date }} {{ $('Record Delivery').item.json.appointment_time }}\n\nTheir message: {{ $('Record Delivery').item.json.current_message }}\nOur reply    : {{ $('Record Delivery').item.json.outbound_message }}\n\nSend mode       : {{ $('Record Delivery').item.json.send_mode }}\nWindow          : {{ $('Record Delivery').item.json.window_reason }}\nAccepted by Meta: {{ $('Record Delivery').item.json.whatsapp_accepted }}\nWhatsApp error  : {{ $('Record Delivery').item.json.whatsapp_error }}\nMessage id      : {{ $('Record Delivery').item.json.whatsapp_message_id }}",
+        "options": {}
+      },
+      "id": "n48-emailteam",
+      "name": "Email Team Alert",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        3300,
+        700
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "291Y8qCIAcqZbFn8",
+          "name": "Gmail SMTP"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.ALERT_EMAIL_FROM || 'alerts@example.com' }}",
+        "toEmail": "={{ $('Record Delivery').item.json.email }}",
+        "subject": "=Your Ascent Interiors appointment is confirmed",
+        "emailFormat": "text",
+        "text": "=Hi {{ $('Record Delivery').item.json.name }},\n\nYour appointment with Ascent Interiors is confirmed.\n\nReference : {{ $('Record Delivery').item.json.appointment_id }}\nDate      : {{ $('Record Delivery').item.json.appointment_date }}\nTime      : {{ $('Record Delivery').item.json.appointment_time }}\n\n23/36 Gariahat Road, near South City College, Dhakuria, Kolkata 29\nPhone / WhatsApp: 8910324464\n\nReply to this email or message us on WhatsApp if you need to reschedule.\n\nAscent Interiors\nascentconstruction.in",
+        "options": {}
+      },
+      "id": "n49-emailbooking",
+      "name": "Email Booking Confirmation",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        3300,
+        300
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "291Y8qCIAcqZbFn8",
+          "name": "Gmail SMTP"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c-n50-hasemail",
+              "leftValue": "={{ !!$('Record Delivery').item.json.email }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "n50-hasemail",
+      "name": "Lead Has Email?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3060,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "If1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "If1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If1": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Ack Meta 200",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ack Meta 200": {
+      "main": [
+        [
+          {
+            "node": "Is Status Callback?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If": {
+      "main": [
+        [
+          {
+            "node": "Extract Lead Event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No Operation, do nothing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Lead Event": {
+      "main": [
+        [
+          {
+            "node": "Needs Graph Fetch?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs Graph Fetch?": {
+      "main": [
+        [
+          {
+            "node": "Meta Get Lead Details",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Normalize Phone",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Meta Get Lead Details": {
+      "main": [
+        [
+          {
+            "node": "Flatten Meta Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Flatten Meta Lead": {
+      "main": [
+        [
+          {
+            "node": "Normalize Phone",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Phone": {
+      "main": [
+        [
+          {
+            "node": "Lookup Lead in CRM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Lookup Lead in CRM": {
+      "main": [
+        [
+          {
+            "node": "Lead Found?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Lead Found?": {
+      "main": [
+        [
+          {
+            "node": "Load Existing Lead",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create New Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Existing Lead": {
+      "main": [
+        [
+          {
+            "node": "Duplicate Event?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Duplicate Event?": {
+      "main": [
+        [
+          {
+            "node": "No Operation, do nothing",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare WhatsApp Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create New Lead": {
+      "main": [
+        [
+          {
+            "node": "Set New Lead Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set New Lead Context": {
+      "main": [
+        [
+          {
+            "node": "Prepare WhatsApp Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare WhatsApp Context": {
+      "main": [
+        [
+          {
+            "node": "Generate AI Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate AI Reply": {
+      "main": [
+        [
+          {
+            "node": "Parse AI Reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "AI Failure Fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Failure Fallback": {
+      "main": [
+        [
+          {
+            "node": "Route Next Action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse AI Reply": {
+      "main": [
+        [
+          {
+            "node": "Route Next Action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Next Action": {
+      "main": [
+        [
+          {
+            "node": "Check Appointment Availability",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Book Appointment",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Plain Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Appointment Availability": {
+      "main": [
+        [
+          {
+            "node": "Format Slots Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Slots Message": {
+      "main": [
+        [
+          {
+            "node": "Pick Send Mode",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Book Appointment": {
+      "main": [
+        [
+          {
+            "node": "Verify Booking",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Booking": {
+      "main": [
+        [
+          {
+            "node": "Pick Send Mode",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Plain Reply": {
+      "main": [
+        [
+          {
+            "node": "Pick Send Mode",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send WhatsApp Reply": {
+      "main": [
+        [
+          {
+            "node": "Record Delivery",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Delivery": {
+      "main": [
+        [
+          {
+            "node": "Update CRM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update CRM": {
+      "main": [
+        [
+          {
+            "node": "Booking Confirmed?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Notify Team?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Booking Confirmed?": {
+      "main": [
+        [
+          {
+            "node": "Send WhatsApp Confirmation",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Lead Has Email?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Done",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send WhatsApp Confirmation": {
+      "main": [
+        [
+          {
+            "node": "Done",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Test Trigger": {
+      "main": [
+        [
+          {
+            "node": "Test Meta Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Test Meta Lead": {
+      "main": [
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Generate AI Reply",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Status Callback?": {
+      "main": [
+        [
+          {
+            "node": "Parse Delivery Status",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Delivery Status": {
+      "main": [
+        [
+          {
+            "node": "Delivery Failed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delivery Failed?": {
+      "main": [
+        [
+          {
+            "node": "Email Delivery Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Done",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email Delivery Alert": {
+      "main": [
+        [
+          {
+            "node": "Done",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pick Send Mode": {
+      "main": [
+        [
+          {
+            "node": "Needs Template?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs Template?": {
+      "main": [
+        [
+          {
+            "node": "Send WhatsApp Template",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send WhatsApp Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send WhatsApp Template": {
+      "main": [
+        [
+          {
+            "node": "Record Delivery",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Team?": {
+      "main": [
+        [
+          {
+            "node": "Email Team Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Email Team Alert": {
+      "main": [
+        []
+      ]
+    },
+    "Lead Has Email?": {
+      "main": [
+        [
+          {
+            "node": "Email Booking Confirmation",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Email Booking Confirmation": {
+      "main": [
+        []
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "id": "RKxDMNibUrbA4tDS"
+}

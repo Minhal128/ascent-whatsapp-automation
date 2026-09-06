@@ -1,0 +1,14 @@
+# Real config. n8n.env.example is the template; the filled-in copy never ships.
+n8n.env
+n8n.env.*
+!n8n.env.example
+
+# Local runtime noise
+_*.log
+_*.err
+_*.json
+*.log
+
+node_modules/
+.DS_Store
+config.bat
